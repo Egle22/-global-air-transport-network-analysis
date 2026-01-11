@@ -1,0 +1,434 @@
+name,description,query,id,parentId,isFolder
+Airports,,,0,,true
+RQ3,,,1,0,true
+RQ2,,,2,0,true
+RQ1,,,3,0,true
+OpenFlights Dataset - Neo4j Import Script,,"// OpenFlights Dataset - Neo4j Import Script
+
+// Files expected in import/OpenFlights folder:
+// - airlines.dat
+// - airports.dat
+// - routes.
+
+// STEP 0: Clean Slate - Delete Current Nodes
+// Delete all nodes and relationships
+MATCH (n) DETACH DELETE n;
+
+// STEP 1: Create Constraints (Primary Keys)
+// Airport constraint - using OpenFlights ID as primary key
+CREATE CONSTRAINT airport_id_cons IF NOT EXISTS
+FOR (a:Airport) REQUIRE a.airport_id IS UNIQUE;
+
+// Airline constraint - using airline ID as primary key
+CREATE CONSTRAINT airline_id_cons IF NOT EXISTS
+FOR (al:Airline) REQUIRE al.airline_id IS UNIQUE;
+
+// Country constraint
+CREATE CONSTRAINT country_name_cons IF NOT EXISTS
+FOR (c:Country) REQUIRE c.name IS UNIQUE;
+
+// City constraint - combination of city name and country
+CREATE CONSTRAINT city_id_cons IF NOT EXISTS
+FOR (ci:City) REQUIRE ci.city_id IS UNIQUE;
+
+// STEP 2: Create Indexes for Performance
+// Airport indexes
+CREATE INDEX airport_id IF NOT EXISTS FOR (a:Airport) ON (a.airport_id);
+CREATE INDEX airport_iata IF NOT EXISTS FOR (a:Airport) ON (a.iata);
+CREATE INDEX airport_icao IF NOT EXISTS FOR (a:Airport) ON (a.icao);
+CREATE INDEX airport_name IF NOT EXISTS FOR (a:Airport) ON (a.name);
+CREATE INDEX airport_city IF NOT EXISTS FOR (a:Airport) ON (a.city);
+// Airline indexes
+CREATE INDEX airline_id IF NOT EXISTS FOR (al:Airline) ON (al.airline_id);
+CREATE INDEX airline_iata IF NOT EXISTS FOR (al:Airline) ON (al.iata);
+CREATE INDEX airline_icao IF NOT EXISTS FOR (al:Airline) ON (al.icao);
+CREATE INDEX airline_name IF NOT EXISTS FOR (al:Airline) ON (al.name);
+
+// STEP 3: Import Airlines
+// Format: Airline ID, Name, Alias, IATA, ICAO, Callsign, Country, Active
+LOAD CSV FROM 'file:///OpenFlights/airlines.dat' AS row
+WITH row
+WHERE row[0] <> '\\N'
+MERGE (al:Airline {airline_id: toInteger(row[0])})
+SET al.name = CASE WHEN row[1] <> '\\N' THEN row[1] ELSE null END,
+    al.alias = CASE WHEN row[2] <> '\\N' THEN row[2] ELSE null END,
+    al.iata = CASE WHEN row[3] <> '\\N' THEN row[3] ELSE null END,
+    al.icao = CASE WHEN row[4] <> '\\N' THEN row[4] ELSE null END,
+    al.callsign = CASE WHEN row[5] <> '\\N' THEN row[5] ELSE null END,
+    al.country = CASE WHEN row[6] <> '\\N' THEN row[6] ELSE null END,
+    al.active = CASE WHEN row[7] = 'Y' THEN true ELSE false END
+WITH al
+WHERE al.country IS NOT NULL
+MERGE (c:Country {name: al.country})
+MERGE (al)-[:BASED_IN]->(c);
+
+// STEP 4: Import Airports
+// Format: Airport ID, Name, City, Country, IATA, ICAO, Lat, Lon, Altitude, 
+//         Timezone, DST, Tz database, Type, Source
+LOAD CSV FROM 'file:///OpenFlights/airports.dat' AS row
+WITH row
+WHERE row[0] <> '\\N'
+MERGE (a:Airport {airport_id: toInteger(row[0])})
+SET a.name = CASE WHEN row[1] <> '\\N' THEN row[1] ELSE null END,
+    a.city = CASE WHEN row[2] <> '\\N' THEN row[2] ELSE null END,
+    a.country = CASE WHEN row[3] <> '\\N' THEN row[3] ELSE null END,
+    a.iata = CASE WHEN row[4] <> '\\N' THEN row[4] ELSE null END,
+    a.icao = CASE WHEN row[5] <> '\\N' THEN row[5] ELSE null END,
+    a.lat = CASE WHEN row[6] <> '\\N' THEN toFloat(row[6]) ELSE null END,
+    a.lon = CASE WHEN row[7] <> '\\N' THEN toFloat(row[7]) ELSE null END,
+    a.altitude = CASE WHEN row[8] <> '\\N' THEN toInteger(row[8]) ELSE null END,
+    a.timezone = CASE WHEN row[9] <> '\\N' THEN toFloat(row[9]) ELSE null END,
+    a.dst = CASE WHEN row[10] <> '\\N' THEN row[10] ELSE null END,
+    a.tz_database = CASE WHEN row[11] <> '\\N' THEN row[11] ELSE null END,
+    a.type = CASE WHEN row[12] <> '\\N' THEN row[12] ELSE null END,
+    a.source = CASE WHEN row[13] <> '\\N' THEN row[13] ELSE null END
+WITH a
+WHERE a.country IS NOT NULL
+MERGE (c:Country {name: a.country})
+
+// Link Airport to its City and connect City to Country
+WITH a, c
+WHERE a.city IS NOT NULL AND a.country IS NOT NULL
+MERGE (ci:City {city_id: a.city + ',' + a.country})
+SET ci.name = a.city,
+    ci.country = a.country
+MERGE (ci)-[:IN_COUNTRY]->(c)
+MERGE (a)-[:IN_CITY]->(ci);
+
+// STEP 5: Import Routes
+// Format: Airline, Airline ID, Source airport, Source airport ID, 
+//         Destination airport, Destination airport ID, Codeshare, 
+//         Stops, Equipment
+LOAD CSV FROM 'file:///OpenFlights/routes.dat' AS row
+WITH row
+// Keep only rows with valid airports and airlines
+WHERE row[2] <> '\\N' AND row[4] <> '\\N' AND row[1] <> '\\N'
+
+// Safely parse numeric IDs
+WITH
+  toInteger(row[1]) AS airline_id,
+  toInteger(row[3]) AS src_id,
+  toInteger(row[5]) AS dst_id,
+  row
+
+// Find corresponding nodes
+MATCH (source:Airport {airport_id: src_id})
+MATCH (dest:Airport {airport_id: dst_id})
+MATCH (airline:Airline {airline_id: airline_id})
+
+// Create Airline-Airport links
+MERGE (airline)-[:OPERATES_FROM]->(source)
+MERGE (airline)-[:OPERATES_TO]->(dest)
+
+// Create Airport-Airport routes
+MERGE (source)-[route:ROUTE{airline_id: airline_id}]->(dest)
+SET route.codeshare = CASE WHEN row[6] = 'Y' THEN true ELSE false END,
+    route.stops = CASE WHEN row[7] <> '\\N' THEN toInteger(row[7]) ELSE 0 END,
+    route.equipment = CASE WHEN row[8] <> '\\N' THEN row[8] ELSE null END,
+    route.weight = route.stops + 1;
+
+",4,0,false
+A. Number of airports and routes per country,,"// A. Number of airports and routes per country
+MATCH (a:Airport)-[:IN_CITY]->(:City)-[:IN_COUNTRY]->(c:Country),(a)-[r:ROUTE]->(a2:Airport)
+RETURN c.name AS Country, COUNT(DISTINCT a) AS airports, COUNT(r) as routes
+ORDER BY routes DESC
+LIMIT 20;",5,2,false
+B. Number of destinations reached from each country,,"// B. Number of destinations reached from each country
+MATCH (a1:Airport)-[:IN_CITY]->(:City)-[:IN_COUNTRY]->(c1:Country), (a1)-[:ROUTE]->(a2:Airport)
+WITH c1, COUNT(DISTINCT a2) AS Destinations
+RETURN c1.name AS Country, Destinations
+ORDER BY Destinations DESC
+LIMIT 20;",6,2,false
+A1. Out degrees of airport nodes,,"// A1. Out degrees of airport nodes
+
+// OUT-DEGREE: Number of outgoing routes (departures from airport)
+MATCH (a:Airport)-[r:ROUTE]->()
+WITH a, COUNT(r) AS out_degree
+RETURN a.name, a.iata, a.city, a.country, out_degree
+ORDER BY out_degree DESC
+LIMIT 20;",7,3,false
+A2. In degrees of airport nodes,,"// A2. In degrees of airport nodes
+
+// IN-DEGREE: Number of incoming routes (arrivals to airport)
+MATCH (a:Airport)<-[r:ROUTE]-()
+WITH a, COUNT(r) AS in_degree
+RETURN a.name, a.iata, a.city, a.country, in_degree
+ORDER BY in_degree DESC
+LIMIT 20;",8,3,false
+A3. Total degrees of airport nodes,,"// A3. Total degrees of airport nodes
+
+// TOTAL DEGREE: Combined outgoing + incoming routes
+MATCH (a:Airport)
+MATCH (a)-[out:ROUTE]->()
+MATCH (a)<-[in:ROUTE]-()
+WITH a, 
+     COUNT(DISTINCT out) AS out_degree,
+     COUNT(DISTINCT in) AS in_degree,
+     COUNT(DISTINCT out) + COUNT(DISTINCT in) AS total_degree
+RETURN a.name, a.iata, a.city, a.country, 
+       out_degree, in_degree, total_degree
+ORDER BY total_degree DESC
+LIMIT 20;",9,3,false
+B1. Pagerank for airport nodes,,"// B1. Pagerank for airport nodes
+
+// PageRank requires GDS library as it's an iterative algorithm
+// that's difficult to implement efficiently in plain Cypher.
+//
+// What GDS does:
+// 1. gds.graph.project: Loads graph into memory for fast computation
+//    - First argument: name for the in-memory graph
+//    - Second argument: which nodes to include (Airport)
+//    - Third argument: which relationships to include (ROUTE)
+//
+// 2. gds.pageRank.write: Runs PageRank algorithm and saves results
+//    - writeProperty: which property to store the score in
+//    - dampingFactor: probability of following a link (0.85 = 85%)
+//    - maxIterations: how many times to run the calculation
+//
+// 3. gds.graph.drop: Removes the in-memory graph to free memory
+
+// STEP 1: Load the airport-route network into memory
+CALL gds.graph.project(
+  'airport-routes-pr',    // Name for this in-memory graph
+  'Airport',              // Include all Airport nodes
+  'ROUTE'                 // Include all ROUTE relationships
+);
+
+// STEP 2: Run PageRank and save results to 'pagerank' property
+CALL gds.pageRank.write(
+  'airport-routes-pr',    // Use the graph we just created
+  {
+    writeProperty: 'pagerank',   // Save score in this property
+    dampingFactor: 0.85,         // Standard value (85% follow links)
+    maxIterations: 100            // Run algorithm 20 times
+  }
+);
+
+// STEP 3: Clean up - remove the in-memory graph
+CALL gds.graph.drop('airport-routes-pr');
+",10,3,false
+B2. Query the results,,"// B2. Query the results
+MATCH (a:Airport)
+WHERE a.pagerank IS NOT NULL
+RETURN a.name, a.iata, a.city, a.country, a.pagerank
+ORDER BY a.pagerank DESC
+LIMIT 20;",11,3,false
+C1. Origins airports per airline,,"// C1. Origins airports per airline
+
+// Number of origin airports per airline (O(l))
+MATCH (al:Airline)-[:OPERATES_FROM]->(a:Airport)
+WITH al, COUNT(DISTINCT a) AS origin_count
+RETURN al.name, al.iata, al.country, origin_count
+ORDER BY origin_count DESC
+LIMIT 20;
+",12,3,false
+C2. Destination airports per airline,,"// C2. Destination airports per airline
+
+// Number of destination airports per airline (D(l))
+MATCH (al:Airline)-[:OPERATES_TO]->(a:Airport)
+WITH al, COUNT(DISTINCT a) AS dest_count
+RETURN al.name, al.iata, al.country, dest_count
+ORDER BY dest_count DESC
+LIMIT 20;
+",13,3,false
+C3. Countries per airline,,"// C3. Countries per airline
+
+// Number of countries reached per airline (C(l))
+MATCH (al:Airline)-[:OPERATES_FROM|OPERATES_TO]->(a:Airport)
+WITH al, COUNT(DISTINCT a.country) AS country_count
+RETURN al.name, al.iata, al.country, country_count
+ORDER BY country_count DESC
+LIMIT 20;
+",14,3,false
+D1. Airlines per airport,,"// D1. Airlines per airport
+
+// Number of airlines per airport (A(a))
+MATCH (a:Airport)<-[:OPERATES_FROM|OPERATES_TO]-(al:Airline)
+WITH a, COUNT(DISTINCT al) AS airline_count
+RETURN a.name, a.iata, a.city, a.country, airline_count
+ORDER BY airline_count DESC
+LIMIT 20;",15,3,false
+D2. Dominance index per airports,,"// D2. Dominance index per airports
+
+// Step 1: pick top PageRank airports
+MATCH (a:Airport)
+WHERE a.pagerank IS NOT NULL
+WITH a
+ORDER BY a.pagerank DESC
+LIMIT 100    // adjust as you wish
+
+// Step 2: collect route counts per airline
+MATCH (a)-[r:ROUTE]-()
+WITH a, r.airline_id AS airline_id
+WITH a, airline_id, COUNT(*) AS route_count
+
+// Step 3: collect per-airline summaries
+WITH a, COLLECT({airline_id: airline_id, routes: route_count}) AS airline_routes
+
+// Step 4: compute totals
+WITH a, airline_routes, REDUCE(total = 0, x IN airline_routes | total + x.routes) AS total_routes
+
+// Step 5: find max routes AND the airline that has them
+WITH a, airline_routes, total_routes,
+     REDUCE(best = {airline_id: NULL, routes: -1},
+            x IN airline_routes |
+            CASE WHEN x.routes > best.routes THEN x ELSE best END
+     ) AS dominant
+
+// Step 6: compute dominance index
+WITH a, total_routes, dominant, (1.0 * dominant.routes) / total_routes AS dominance
+
+// Step 7: fetch dominant airline’s name and return results
+MATCH (dom_airline:Airline {airline_id: dominant.airline_id})
+RETURN a.name AS airport_name,
+       a.iata AS airport_iata,
+       a.city AS city,
+       a.country AS country,
+       a.pagerank AS pagerank,
+       dominance,
+       total_routes,
+       dom_airline.name AS dominant_airline_name,
+       dom_airline.iata AS dominant_airline_iata,
+       dominant.routes AS dominant_airline_routes
+ORDER BY dominance DESC;
+",16,3,false
+C. Number of countries reachable from each country,,"// C. Number of countries reachable from each country
+MATCH (origin:Country)<-[:IN_COUNTRY]-(:City)<-[:IN_CITY]-(a1:Airport)-[:ROUTE]->(a2:Airport)-[:IN_CITY]->(:City)-[:IN_COUNTRY]->(dest:Country)
+WHERE origin <> dest
+WITH origin.name as OriginCountry, 
+     COUNT(DISTINCT dest) as CountriesReached,
+     COUNT(DISTINCT a1) as AirportsUsed
+RETURN OriginCountry, CountriesReached, AirportsUsed
+ORDER BY CountriesReached DESC
+LIMIT 20;",17,2,false
+D. Bottom 10 least connected countries (with at least 1 route),,"// D. Bottom 10 least connected countries (with at least 1 route)
+MATCH (c:Country)<-[:IN_COUNTRY]-(:City)<-[:IN_CITY]-(a:Airport)-[r:ROUTE]->()
+WITH c.name as Country, COUNT(r) as TotalRoutes
+RETURN Country, TotalRoutes
+ORDER BY TotalRoutes ASC
+LIMIT 10;",18,2,false
+E. Top 10 most connected countries,,"// E. Top 10 most connected countries
+MATCH (c:Country)<-[:IN_COUNTRY]-(:City)<-[:IN_CITY]-(a:Airport)-[r:ROUTE]->()
+WITH c.name as Country, COUNT(r) as TotalRoutes
+RETURN Country, TotalRoutes, 'Top 10' as Category
+ORDER BY TotalRoutes DESC
+LIMIT 10;",19,2,false
+F. Data preparation for Gini coefficient calculation (export to Python),,"// F. Data preparation for Gini coefficient calculation (export to Python)
+MATCH (c:Country)<-[:IN_COUNTRY]-(:City)<-[:IN_CITY]-(a:Airport)-[r:ROUTE]->()
+WITH c.name as Country, COUNT(r) as Routes
+ORDER BY Routes ASC
+RETURN Country, Routes;",20,2,false
+G. Top-k concentration,,"// G. Top-k concentration
+
+// choose k
+WITH 20 AS k
+
+// Step 1: compute total routes per country (origin routes)
+MATCH (c:Country)<-[:IN_COUNTRY]-(:City)<-[:IN_CITY]-(a:Airport)-[r:ROUTE]->()
+WITH k, c.name AS country, COUNT(r) AS routeCount
+
+// Step 2: collect country route counts into a list sorted descending
+ORDER BY routeCount DESC
+WITH k, collect({country: country, routes: routeCount}) AS countryData
+
+// Step 3: compute total routes and top-k routes
+WITH k, countryData, REDUCE(total = 0, x IN countryData | total + x.routes) AS totalRoutes, countryData[0..k] AS topKdata
+
+// Step 4: sum top-k routes
+WITH k, totalRoutes, topKdata, REDUCE(topKsum = 0, x IN topKdata | topKsum + x.routes) AS topKroutes
+
+// Step 5: compute CR_k
+RETURN k AS TopK, totalRoutes, topKroutes, 1.0 * topKroutes / totalRoutes AS CR_k;
+",21,2,false
+A1. Betweenness for airport nodes,,"// A1. Betweenness for airport nodes
+
+// Betweenness requires GDS library as it's an algorithm
+// that's difficult to implement efficiently in plain Cypher.
+//
+// What GDS does:
+// 1. gds.graph.project: Loads graph into memory for fast computation
+//    - First argument: name for the in-memory graph
+//    - Second argument: which nodes to include (Airport)
+//    - Third argument: which relationships to include (ROUTE)
+//
+// 2. gds.betweenness.write: Runs betweenness algorithm and saves results
+//    - writeProperty: which property to store the score in
+//
+// 3. gds.graph.drop: Removes the in-memory graph to free memory
+
+// STEP 1: Load the airport-route network into memory
+CALL gds.graph.project(
+  'airport-routes-bn',    // Name for this in-memory graph
+  'Airport',              // Include all Airport nodes
+  'ROUTE'                 // Include all ROUTE relationships
+);
+
+// STEP 2: Run betweenness and save results to 'betweenness' property
+CALL gds.betweenness.write(
+  'airport-routes-bn',    // Use the graph we just created
+  {
+    writeProperty: 'betweenness'   // Save score in this property
+  }
+);
+
+// STEP 3: Clean up - remove the in-memory graph
+CALL gds.graph.drop('airport-routes-bn');
+",22,1,false
+A2. Query the results,,"// A2. Query the results
+
+MATCH (a:Airport)
+RETURN a.name AS airport,
+       a.iata AS iata,
+       a.country AS country,
+       a.betweenness AS betweenness
+ORDER BY betweenness DESC;
+",23,1,false
+B1. Louvain for airport nodes,,"// B1. Louvain for airport nodes
+
+// Louvain requires GDS library as it's an algorithm
+// that's difficult to implement efficiently in plain Cypher.
+//
+// What GDS does:
+// 1. gds.graph.project: Loads graph into memory for fast computation
+//    - First argument: name for the in-memory graph
+//    - Second argument: which nodes to include (Airport)
+//    - Third argument: which relationships to include (ROUTE)
+//
+// 2. gds.louvain.write: Runs Louvain algorithm and saves results
+//    - writeProperty: which property to store the score in
+//
+// 3. gds.graph.drop: Removes the in-memory graph to free memory
+
+// STEP 1: Load the airport-route network into memory
+CALL gds.graph.project(
+  'airport-routes-bn',    // Name for this in-memory graph
+  'Airport',              // Include all Airport nodes
+  'ROUTE'                 // Include all ROUTE relationships
+);
+
+// STEP 2: Run Louvain and save results to 'louvain' property
+CALL gds.louvain.write(
+  'airport-routes-bn',    // Use the graph we just created
+  {
+    writeProperty: 'louvain'   // Save louvain membership in this property
+  }
+);
+
+// STEP 3: Clean up - remove the in-memory graph
+CALL gds.graph.drop('airport-routes-bn');
+",24,1,false
+B2. Detect Louvain communities using Louvain membership,,"// B2. Detect Louvain communities using Louvain membership
+MATCH (a:Airport)
+RETURN a.louvain AS Community, COUNT(*) AS Members
+ORDER BY Members DESC;",25,1,false
+B3. Identify airports connecting multiple Louvain communities,,"// B3. Identify airports connecting multiple Louvain communities
+MATCH (a:Airport)-[:ROUTE]->(b:Airport)
+WHERE a.louvain <> b.louvain
+RETURN 
+    a.name AS BridgeAirport,
+    a.iata AS IATA,
+    a.country AS Country,
+    COUNT(DISTINCT b.louvain) AS CommunitiesConnected
+ORDER BY CommunitiesConnected DESC 
+LIMIT 15;
+",26,1,false
